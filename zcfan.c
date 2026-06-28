@@ -48,26 +48,36 @@ static size_t num_ignored_sensors = 0;
 static int sensor_fds[MAX_SENSOR_FDS];
 static size_t num_sensor_fds = 0;
 
-/* Must be highest to lowest temp */
-enum FanLevel { FAN_MAX, FAN_MED, FAN_LOW, FAN_OFF, FAN_INVALID };
+/*
+ * Dynamic fan rules: up to MAX_TIERS active tiers + 1 "off" sentinel.
+ * Rules are stored highest-to-lowest threshold order.
+ * The last entry is always the "off" sentinel (threshold = TEMP_MIN).
+ */
+#define MAX_TIERS 8
+
 struct Rule {
     char tpacpi_level[CONFIG_MAX_STRLEN + 1];
     int threshold;
-    const char *name;
+    char name[32];
 };
-static struct Rule rules[] = {
-    [FAN_MAX] = {"full-speed", 90, "maximum"},
-    [FAN_MED] = {"4", 80, "medium"},
-    [FAN_LOW] = {"1", 70, "low"},
-    [FAN_OFF] = {"0", TEMP_MIN, "off"},
-};
+
+static struct Rule rules[MAX_TIERS + 1]; /* +1 for the "off" sentinel */
+static size_t num_tiers = 0;            /* active tiers, excludes "off" */
+
+static void init_default_rules(void) {
+    rules[0] = (struct Rule){"full-speed", 90, "maximum"};
+    rules[1] = (struct Rule){"4", 80, "medium"};
+    rules[2] = (struct Rule){"1", 70, "low"};
+    rules[3] = (struct Rule){"0", TEMP_MIN, "off"};
+    num_tiers = 3;
+}
 
 static struct timespec last_watchdog_ping = {0, 0};
 static time_t watchdog_secs = DEFAULT_WATCHDOG_SECS;
 static int temp_hysteresis = 10;
 static const unsigned int tick_hysteresis = 3;
 /* Number of consecutive seconds a higher fan level must persist before
- * actually ramping the fan up. Make configurable via /etc/zcfan.conf
+ * actually ramping the fan up. Configurable via /etc/zcfan.conf.
  */
 static unsigned int up_delay_ticks = 3;
 static char output_buf[512];
@@ -302,7 +312,8 @@ static enum set_fan_status set_fan_level(void) {
         return FAN_LEVEL_INVALID;
     }
 
-    for (size_t i = 0; i < FAN_INVALID; i++) {
+    /* Iterate num_tiers + 1 to include the "off" sentinel */
+    for (size_t i = 0; i <= num_tiers; i++) {
         const struct Rule *rule = rules + i;
 
         if (rule == current_rule) {
@@ -316,9 +327,11 @@ static enum set_fan_status set_fan_level(void) {
         // -------- FAN-UP with Delay --------
         if (rule < current_rule) { // rule index smaller means higher fan level
             if ((rule->threshold - temp_penalty) < max_temp) {
-                up_delay_counter++;
-                if (up_delay_counter < up_delay_ticks) {
-                    return FAN_LEVEL_NOT_SET; // not ready yet
+                if (up_delay_ticks > 0) {
+                    up_delay_counter++;
+                    if (up_delay_counter < up_delay_ticks) {
+                        return FAN_LEVEL_NOT_SET; // not ready yet
+                    }
                 }
                 // OK, promote
                 up_delay_counter = 0;
@@ -392,16 +405,54 @@ static void maybe_ping_watchdog(void) {
     do {                                                                       \
         char val[CONFIG_MAX_STRLEN + 1];                                       \
         if (fscanf(f, name " %" S_CONFIG_MAX_STRLEN "s ", val) == 1) {         \
-            strncpy(dest, val, CONFIG_MAX_STRLEN);                             \
-            dest[CONFIG_MAX_STRLEN] = '\0';                                    \
+            snprintf(dest, sizeof(dest), "%s", val);                           \
         } else {                                                               \
             expect(fseek(f, pos, SEEK_SET) == 0);                              \
         }                                                                      \
     } while (0)
 
+/* Compare rules by threshold descending for qsort */
+static int rule_cmp_desc(const void *a, const void *b) {
+    const struct Rule *ra = (const struct Rule *)a;
+    const struct Rule *rb = (const struct Rule *)b;
+    if (rb->threshold > ra->threshold) return 1;
+    if (rb->threshold < ra->threshold) return -1;
+    return 0;
+}
+
+/* Try to parse a "tier <temp> <level>" line. Returns 1 on success, 0 otherwise. */
+static int fscanf_tier(FILE *f, long pos) {
+    int temp;
+    char level[CONFIG_MAX_STRLEN + 1];
+
+    if (fscanf(f, "tier %d %" S_CONFIG_MAX_STRLEN "s ", &temp, level) == 2) {
+        if (num_tiers >= MAX_TIERS) {
+            err("%s: too many tiers (max %d)\n", CONFIG_PATH, MAX_TIERS);
+            exit(1);
+        }
+        struct Rule *r = &rules[num_tiers];
+        snprintf(r->tpacpi_level, sizeof(r->tpacpi_level), "%s", level);
+        r->threshold = temp;
+        snprintf(r->name, sizeof(r->name), "tier%zu", num_tiers + 1);
+        num_tiers++;
+        return 1;
+    }
+
+    expect(fseek(f, pos, SEEK_SET) == 0);
+    return 0;
+}
+
 static void get_config(void) {
     FILE *f;
     int up_delay_ticks_tmp = (int)up_delay_ticks;
+    bool has_tier_lines = false;
+
+    /* Legacy config holders — only applied if no tier lines found */
+    int legacy_max_temp = 90, legacy_med_temp = 80, legacy_low_temp = 70;
+    char legacy_max_level[CONFIG_MAX_STRLEN + 1] = "full-speed";
+    char legacy_med_level[CONFIG_MAX_STRLEN + 1] = "4";
+    char legacy_low_level[CONFIG_MAX_STRLEN + 1] = "1";
+    bool has_legacy_keys = false;
 
     f = fopen(CONFIG_PATH, "re");
     if (!f) {
@@ -412,24 +463,103 @@ static void get_config(void) {
         return;
     }
 
+    /* Reset tiers for fresh parse — defaults already set by init_default_rules() */
+    num_tiers = 0;
+
     while (!feof(f)) {
         long pos = ftell(f);
         int ch;
         expect(pos >= 0);
-        fscanf_int_for_key(f, pos, "max_temp", rules[FAN_MAX].threshold);
-        fscanf_int_for_key(f, pos, "med_temp", rules[FAN_MED].threshold);
-        fscanf_int_for_key(f, pos, "low_temp", rules[FAN_LOW].threshold);
+
+        /* Try tier lines first */
+        if (fscanf_tier(f, pos)) {
+            has_tier_lines = true;
+            continue;
+        }
+
+        /* Legacy keys — parse into temp holders */
+        {
+            long before = ftell(f);
+            fscanf_int_for_key(f, pos, "max_temp", legacy_max_temp);
+            if (ftell(f) != before) { has_legacy_keys = true; continue; }
+        }
+        {
+            long before = ftell(f);
+            fscanf_int_for_key(f, pos, "med_temp", legacy_med_temp);
+            if (ftell(f) != before) { has_legacy_keys = true; continue; }
+        }
+        {
+            long before = ftell(f);
+            fscanf_int_for_key(f, pos, "low_temp", legacy_low_temp);
+            if (ftell(f) != before) { has_legacy_keys = true; continue; }
+        }
+        {
+            long before = ftell(f);
+            fscanf_str_for_key(f, pos, "max_level", legacy_max_level);
+            if (ftell(f) != before) { has_legacy_keys = true; continue; }
+        }
+        {
+            long before = ftell(f);
+            fscanf_str_for_key(f, pos, "med_level", legacy_med_level);
+            if (ftell(f) != before) { has_legacy_keys = true; continue; }
+        }
+        {
+            long before = ftell(f);
+            fscanf_str_for_key(f, pos, "low_level", legacy_low_level);
+            if (ftell(f) != before) { has_legacy_keys = true; continue; }
+        }
+
+        /* Common keys */
         fscanf_int_for_key(f, pos, "watchdog_secs", watchdog_secs);
         fscanf_int_for_key(f, pos, "temp_hysteresis", temp_hysteresis);
         fscanf_int_for_key(f, pos, "up_delay_ticks", up_delay_ticks_tmp);
-        fscanf_str_for_key(f, pos, "max_level", rules[FAN_MAX].tpacpi_level);
-        fscanf_str_for_key(f, pos, "med_level", rules[FAN_MED].tpacpi_level);
-        fscanf_str_for_key(f, pos, "low_level", rules[FAN_LOW].tpacpi_level);
         fscanf_ignore_sensor(f, pos);
         if (ftell(f) == pos) {
             while ((ch = fgetc(f)) != EOF && ch != '\n') {}
         }
     }
+
+    fclose(f);
+
+    if (has_tier_lines) {
+        /* Warn if legacy keys were also present */
+        if (has_legacy_keys) {
+            info("tier lines found; ignoring legacy max_temp/med_temp/low_temp keys\n");
+        }
+        /* Sort tiers descending by threshold */
+        qsort(rules, num_tiers, sizeof(struct Rule), rule_cmp_desc);
+
+        /* Validate no duplicate thresholds */
+        for (size_t i = 1; i < num_tiers; i++) {
+            if (rules[i].threshold == rules[i - 1].threshold) {
+                err("%s: duplicate tier threshold %dC\n",
+                    CONFIG_PATH, rules[i].threshold);
+                exit(1);
+            }
+        }
+
+        /* Re-number tier names after sort */
+        for (size_t i = 0; i < num_tiers; i++) {
+            snprintf(rules[i].name, sizeof(rules[i].name), "tier%zu", i + 1);
+        }
+    } else {
+        /* Legacy mode: build 3 rules from legacy holders */
+        num_tiers = 3;
+        rules[0] = (struct Rule){{0}, legacy_max_temp, "maximum"};
+        snprintf(rules[0].tpacpi_level, sizeof(rules[0].tpacpi_level),
+                 "%s", legacy_max_level);
+
+        rules[1] = (struct Rule){{0}, legacy_med_temp, "medium"};
+        snprintf(rules[1].tpacpi_level, sizeof(rules[1].tpacpi_level),
+                 "%s", legacy_med_level);
+
+        rules[2] = (struct Rule){{0}, legacy_low_temp, "low"};
+        snprintf(rules[2].tpacpi_level, sizeof(rules[2].tpacpi_level),
+                 "%s", legacy_low_level);
+    }
+
+    /* Append "off" sentinel */
+    rules[num_tiers] = (struct Rule){"0", TEMP_MIN, "off"};
 
     /* Maximum value handled by the kernel is 120, and
      * (watchdog_secs - WATCHDOG_GRACE_PERIOD_SECS) must stay positive. */
@@ -446,14 +576,17 @@ static void get_config(void) {
         err("%s: value for the up_delay_ticks directive must be between 0 and 60\n", CONFIG_PATH);
         exit(1);
     }
-
-    fclose(f);
 }
 
 static void print_thresholds(void) {
-    for (size_t i = 0; i < FAN_OFF; i++) {
+    for (size_t i = 0; i < num_tiers; i++) {
         const struct Rule *rule = rules + i;
-        printf("[CFG] At %dC fan is set to %s\n", rule->threshold, rule->name);
+        printf("[CFG] At %dC fan is set to %s (level %s)\n",
+               rule->threshold, rule->name, rule->tpacpi_level);
+    }
+    if (up_delay_ticks > 0) {
+        printf("[CFG] Fan ramp-up delay: %u tick%s\n",
+               up_delay_ticks, up_delay_ticks == 1 ? "" : "s");
     }
     printf("[CFG] Ignored %zu present sensors based on config\n",
            num_ignored_sensors);
@@ -488,6 +621,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    init_default_rules();
     get_config();
     expect(sigaction(SIGTERM, &sa_exit, NULL) == 0);
     expect(sigaction(SIGINT, &sa_exit, NULL) == 0);
@@ -500,10 +634,11 @@ int main(int argc, char *argv[]) {
 
     expect(setvbuf(stdout, output_buf, _IOLBF, sizeof(output_buf)) == 0);
 
-    if (!full_speed_supported()) {
+    /* Check if the highest tier uses "full-speed" and it's not supported */
+    if (strcmp(rules[0].tpacpi_level, "full-speed") == 0 &&
+        !full_speed_supported()) {
         err("level \"full-speed\" not supported, using level 7\n");
-        strncpy(rules[FAN_MAX].tpacpi_level, "7", CONFIG_MAX_STRLEN);
-        rules[FAN_MAX].tpacpi_level[CONFIG_MAX_STRLEN] = '\0';
+        snprintf(rules[0].tpacpi_level, sizeof(rules[0].tpacpi_level), "7");
     }
 
     write_watchdog_timeout(watchdog_secs);
