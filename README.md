@@ -1,11 +1,23 @@
-# zcfan | [![Tests](https://img.shields.io/github/actions/workflow/status/cdown/zcfan/ci.yml?branch=master)](https://github.com/cdown/zcfan/actions?query=branch%3Amaster)
+# zcfan
 
-Zero-configuration fan control daemon for ThinkPads.
+Fork of [cdown/zcfan](https://github.com/cdown/zcfan) with multi-tier fan
+control and ramp-up delay for Meteor Lake ThinkPads.
+
+## What's different from upstream
+
+- **Multi-tier fan control**: configure up to 8 fan tiers via the `tier`
+  keyword instead of the fixed 3-tier (max/med/low) setup
+- **Ramp-up delay**: configurable `up_delay_ticks` (default 3) delays fan
+  speed increases to filter transient temperature spikes
+  (cherry-picked from [y1lichen/zcfan](https://github.com/y1lichen/zcfan),
+  see [zcfan#40](https://github.com/cdown/zcfan/issues/40))
+- **Full backward compatibility**: without `tier` lines, behaves identically
+  to upstream (legacy `max_temp`/`med_temp`/`low_temp` keys still work)
 
 ## Features
 
-- Extremely small (~250 lines), simple, and easy to understand code
-- Sensible out of the box, configuration is optional (see "usage" below)
+- Extremely small, simple, and easy to understand code
+- Sensible out of the box, configuration is optional
 - Strong focus on stopping the fan as soon as safe to do so, without inducing
   throttling
 - Automatic temperature- and time-based hysteresis: no bouncing between fan
@@ -17,7 +29,7 @@ Zero-configuration fan control daemon for ThinkPads.
 ## Usage
 
 zcfan reads all temperature sensors present on the system. By default, it has
-the following default fan states:
+the following fan states:
 
 | Config name | thinkpad_acpi fan level           | Default trip temperature (C) |
 |-------------|-----------------------------------|------------------------------|
@@ -27,12 +39,35 @@ the following default fan states:
 
 If no trip temperature is reached, the fan will be turned off.
 
-The fan will also only be reduced once the temperature is now at least 10C
-below the trip temperature for the current fan state. This can be tuned with
-the config parameter `temp_hysteresis`.
+### Multi-tier configuration
 
-To override these defaults, you can place a file at `/etc/zcfan.conf` with
-updated trip temperatures in degrees celsius and/or fan levels. As an example:
+Instead of the 3 fixed tiers, you can define up to 8 custom tiers using the
+`tier` keyword. Each line specifies a temperature threshold and a fan level
+(0-7, `full-speed`, or `disengaged`):
+
+    tier 45 1
+    tier 60 4
+    tier 75 5
+    tier 90 7
+
+Tiers are automatically sorted by temperature. Below the lowest tier's
+threshold, the fan is turned off.
+
+When any `tier` line is present, legacy `max_temp`/`med_temp`/`low_temp` and
+`max_level`/`med_level`/`low_level` keys are ignored.
+
+### Ramp-up delay
+
+To prevent fan flutter from brief temperature spikes (common on Intel Meteor
+Lake), the fan waits `up_delay_ticks` consecutive seconds above a threshold
+before actually ramping up. Default is 3. Set to 0 to disable:
+
+    up_delay_ticks 3
+
+### Legacy configuration
+
+To override the 3 default tiers without using the `tier` keyword, place a file
+at `/etc/zcfan.conf` with updated trip temperatures and/or fan levels:
 
     max_temp 85
     med_temp 70
